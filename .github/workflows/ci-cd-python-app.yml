@@ -5,9 +5,9 @@ name: CI/CD Workflow
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feat/gke-deployment ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, feat/gke-deployment ]
 
 jobs:
   build:
@@ -83,7 +83,8 @@ jobs:
     env:
       PROJECT_ID: ${{ secrets.GKE_PROJECT }}
       GKE_CLUSTER: autopilot-cluster-1    # TODO: update to cluster name
-      GKE_REGION: us-central1	   # TODO: update to cluster region
+      GKE_REGION: europe-west2	   # TODO: update to cluster region
+      USE_GKE_GCLOUD_AUTH_PLUGIN: True
 
     steps:
     - name: Check out code
@@ -102,33 +103,95 @@ jobs:
 
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v0
+      with:
+        install_kubectl: true
+
+    - name: Verify kubectl is available
+      run: |
+        which kubectl || echo "kubectl not in PATH"
+        kubectl version --client || echo "kubectl command failed, installing manually..."
+        # Fallback: install kubectl if not available
+        if ! command -v kubectl &> /dev/null; then
+          echo "Installing kubectl manually..."
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
+        fi
+
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        # Install the GKE auth plugin required for kubectl to authenticate with GKE clusters
+        gcloud components install gke-gcloud-auth-plugin --quiet || echo "Plugin may already be installed"
+        # Ensure it's in the PATH
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
 
     - name: Get the GKE credentials so we can deploy to the cluster
       run: |
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
         gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_REGION"
 
-    - name: Create namespace & set in Kustomize
+    - name: Determine active namespace and create new deployment namespace
       run: |
-         namespacePresentBlue=`kubectl get ns | grep python-app-blue | wc -l`
-         namespacePresentGreen=`kubectl get ns | grep python-app-green | wc -l`
-         if [ $namespacePresentBlue -eq 0 ]
-         then
+         # Check which namespaces exist
+         namespacePresentBlue=$(kubectl get ns python-app-blue 2>/dev/null | wc -l || echo "0")
+         namespacePresentGreen=$(kubectl get ns python-app-green 2>/dev/null | wc -l || echo "0")
+         
+         # Determine which namespace is currently active (has the active annotation or is the only one with a deployment)
+         activeNamespace=""
+         if [ "$namespacePresentBlue" -eq 1 ]; then
+           activeCheck=$(kubectl get ns python-app-blue -o jsonpath='{.metadata.annotations.deployment\.active}' 2>/dev/null || echo "")
+           if [ "$activeCheck" = "true" ] || [ "$namespacePresentGreen" -eq 0 ]; then
+             activeNamespace="python-app-blue"
+           fi
+         fi
+         
+         if [ "$namespacePresentGreen" -eq 1 ] && [ -z "$activeNamespace" ]; then
+           activeCheck=$(kubectl get ns python-app-green -o jsonpath='{.metadata.annotations.deployment\.active}' 2>/dev/null || echo "")
+           if [ "$activeCheck" = "true" ]; then
+             activeNamespace="python-app-green"
+           fi
+         fi
+         
+         # Determine new and old namespaces
+         if [ "$namespacePresentBlue" -eq 0 ]; then
+            echo "Creating new blue namespace"
             kubectl create ns python-app-blue
             cd k8s
             kustomize edit set namespace python-app-blue
             echo "NEW_NAMESPACE=python-app-blue" >> $GITHUB_ENV
             echo "OLD_NAMESPACE=python-app-green" >> $GITHUB_ENV
-         elif [ $namespacePresentGreen -eq 0 ]
-         then
+         elif [ "$namespacePresentGreen" -eq 0 ]; then
+            echo "Creating new green namespace"
             kubectl create ns python-app-green
             cd k8s
             kustomize edit set namespace python-app-green
             echo "NEW_NAMESPACE=python-app-green" >> $GITHUB_ENV
             echo "OLD_NAMESPACE=python-app-blue" >> $GITHUB_ENV
          else
-            echo "Both Blue and Green namespaces are present! Exiting"
-            exit 1
+            echo "Both Blue and Green namespaces are present!"
+            if [ -n "$activeNamespace" ]; then
+              echo "Active namespace detected: $activeNamespace"
+              if [ "$activeNamespace" = "python-app-blue" ]; then
+                echo "Deploying to green namespace (switching from blue)"
+                cd k8s
+                kustomize edit set namespace python-app-green
+                echo "NEW_NAMESPACE=python-app-green" >> $GITHUB_ENV
+                echo "OLD_NAMESPACE=python-app-blue" >> $GITHUB_ENV
+              else
+                echo "Deploying to blue namespace (switching from green)"
+                cd k8s
+                kustomize edit set namespace python-app-blue
+                echo "NEW_NAMESPACE=python-app-blue" >> $GITHUB_ENV
+                echo "OLD_NAMESPACE=python-app-green" >> $GITHUB_ENV
+              fi
+            else
+              echo "Error: Cannot determine active namespace. Please clean up one namespace manually."
+              exit 1
+            fi
          fi
+         echo "Deploying to: ${{ env.NEW_NAMESPACE }}"
+         echo "Will remove: ${{ env.OLD_NAMESPACE }}"
 
     - name: Update Kubernetes resources
       env:
@@ -138,22 +201,99 @@ jobs:
        kustomize edit set image hello-gitops=$DOCKER_USERNAME/hello-gitops:$GITHUB_SHA
        cat kustomization.yaml
     
-    - name: Deploy updated Kubernetes resources
+    - name: Deploy to new namespace (Blue/Green)
       run: |
-        kubectl apply -k k8s/ 
-   
-    # DO SOME CHECKS HERE BEFORE COMMIT
-    #- name: Deploy updated Kubernetes resources
-    #  run: |
-    #    kubectl apply -k k8s/
-
-    # REMOVE OLD DEPLOYMENT!!
-    - name: Remove old namespace
+        kubectl apply -k k8s/
+    
+    - name: Wait for new deployment rollout
       run: |
-        namespacePresentOld=`kubectl get ns | grep ${{ env.OLD_NAMESPACE }} | wc -l`
-        if [ $namespacePresentOld -eq 1 ]
+        echo "Waiting for deployment to be ready in namespace ${{ env.NEW_NAMESPACE }}"
+        kubectl rollout status deployment/hello-gitops -n ${{ env.NEW_NAMESPACE }} --timeout=5m
+    
+    - name: Verify new deployment health
+      id: health_check
+      run: |
+        echo "Verifying deployment health in namespace ${{ env.NEW_NAMESPACE }}"
+        # Check if all pods are ready
+        readyPods=$(kubectl get deployment hello-gitops -n ${{ env.NEW_NAMESPACE }} -o jsonpath='{.status.readyReplicas}' || echo "0")
+        desiredReplicas=$(kubectl get deployment hello-gitops -n ${{ env.NEW_NAMESPACE }} -o jsonpath='{.spec.replicas}' || echo "0")
+        
+        if [ "$readyPods" != "$desiredReplicas" ] || [ "$readyPods" -eq 0 ]; then
+          echo "Error: Not all pods are ready. Ready: $readyPods, Desired: $desiredReplicas"
+          echo "Rolling back: keeping old namespace active"
+          exit 1
+        fi
+        echo "All $readyPods pods are ready"
+        
+        # Check pod status
+        kubectl get pods -n ${{ env.NEW_NAMESPACE }} -l app=hello-gitops
+        
+        # Optional: Check pod health endpoints if available
+        # Uncomment and adjust the health check endpoint as needed
+        # kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n ${{ env.NEW_NAMESPACE }} -- \
+        #   curl -f http://hello-gitops:8050/health || exit 1
+    
+    - name: Annotate active namespace for traffic routing
+      run: |
+        # Annotate the active namespace so external systems (ingress controllers, load balancers) know where to route
+        kubectl annotate namespace ${{ env.NEW_NAMESPACE }} \
+          deployment.active=true \
+          deployment.timestamp=$(date +%s) \
+          --overwrite
+        echo "Active deployment namespace annotated: ${{ env.NEW_NAMESPACE }}"
+        
+        # If old namespace exists, remove active annotation
+        if kubectl get namespace ${{ env.OLD_NAMESPACE }} &>/dev/null 2>&1; then
+          kubectl annotate namespace ${{ env.OLD_NAMESPACE }} deployment.active- || true
+          echo "Removed active annotation from old namespace: ${{ env.OLD_NAMESPACE }}"
+        fi
+    
+    - name: Verify service is accessible in new namespace
+      run: |
+        # Verify the service exists and endpoints are ready
+        echo "Checking service in namespace: ${{ env.NEW_NAMESPACE }}"
+        kubectl get service hello-gitops -n ${{ env.NEW_NAMESPACE }}
+        kubectl get endpoints hello-gitops -n ${{ env.NEW_NAMESPACE }}
+        
+        # Check that endpoints are populated
+        endpointIPs=$(kubectl get endpoints hello-gitops -n ${{ env.NEW_NAMESPACE }} -o jsonpath='{.subsets[0].addresses[*].ip}' | wc -w)
+        if [ "$endpointIPs" -eq 0 ]; then
+          echo "Warning: No endpoints found for service. Deployment may not be fully ready."
+          exit 1
+        fi
+        echo "Service has $endpointIPs endpoint(s) ready"
+    
+    - name: Verify traffic routing
+      run: |
+        echo "Verifying that traffic is routing to the new namespace: ${{ env.NEW_NAMESPACE }}"
+        # Wait a moment for any ingress/load balancer updates
+        sleep 10
+        
+        # Check ingress in the new namespace
+        if kubectl get ingress hello-gitops -n ${{ env.NEW_NAMESPACE }} &>/dev/null; then
+          echo "Ingress found in ${{ env.NEW_NAMESPACE }} namespace:"
+          kubectl get ingress hello-gitops -n ${{ env.NEW_NAMESPACE }}
+        fi
+        
+        # Check for ingress in default namespace (if using shared ingress)
+        if kubectl get ingress hello-gitops -n default &>/dev/null; then
+          echo "Ingress found in default namespace:"
+          kubectl get ingress hello-gitops -n default
+        fi
+        
+        echo "Note: Ensure your ingress controller/load balancer is configured to route to namespace: ${{ env.NEW_NAMESPACE }}"
+        echo "The namespace has been annotated with deployment.active=true for easy identification"
+    
+    - name: Remove old namespace (after successful deployment)
+      run: |
+        namespacePresentOld=$(kubectl get ns | grep -c "${{ env.OLD_NAMESPACE }}" || echo "0")
+        if [ "$namespacePresentOld" -eq 1 ]
         then
-          kubectl delete ns ${{ env.OLD_NAMESPACE }} --wait=true
+          echo "Removing old namespace: ${{ env.OLD_NAMESPACE }}"
+          kubectl delete ns ${{ env.OLD_NAMESPACE }} --wait=true --timeout=5m
+          echo "Old namespace removed successfully"
+        else
+          echo "Old namespace ${{ env.OLD_NAMESPACE }} not found, skipping deletion"
         fi
  
     - name: Commit files
