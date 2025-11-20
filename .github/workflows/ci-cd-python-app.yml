@@ -88,7 +88,9 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history to avoid conflicts
 
     - name: Setup Kustomize
       uses: imranismail/setup-kustomize@v1
@@ -296,8 +298,13 @@ jobs:
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git commit -am "Bump docker tag"
+    
+    - name: Pull latest changes before pushing
+      run: |
+        git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes to pull"
         
     - name: Push changes
       uses: ad-m/github-push-action@master
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }} 
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ github.ref_name }} 
