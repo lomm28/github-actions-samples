@@ -5,9 +5,9 @@ name: CI/CD Workflow
 
 on:
   push:
-    branches: [ main ]
+    branches: [ feat/gke-deployment ]
   pull_request:
-    branches: [ main ]
+    branches: [ feat/gke-deployment ]
 
 jobs:
   build:
