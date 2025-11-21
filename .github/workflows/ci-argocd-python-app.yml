@@ -121,7 +121,16 @@ jobs:
         export USE_GKE_GCLOUD_AUTH_PLUGIN=True
         gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_REGION"
 
+    - name: Prepare Git for commit and push
+      if: "github.event_name != 'pull_request'"
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        # Pull latest changes first, before making any modifications
+        git pull --rebase origin main
+
     - name: Update Kubernetes resources
+      if: "github.event_name != 'pull_request'"
       env:
         DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       run: |
@@ -149,14 +158,6 @@ jobs:
         # Ensure automated sync policy is enabled (idempotent)
         kubectl patch application python-app -n argocd \
           --type merge -p '{"spec": {"syncPolicy": {"automated": {"selfHeal": true, "prune": true}}}}' || echo "Application may not exist yet, will be created on next step"
-
-    - name: Prepare Git for commit and push
-      if: "github.event_name != 'pull_request'"
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        # Pull latest changes to avoid conflicts
-        git pull --rebase origin main
 
     - name: Commit files
       if: "github.event_name != 'pull_request'"
