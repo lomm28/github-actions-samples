@@ -159,6 +159,10 @@ jobs:
           echo "No changes to commit"
         fi
 
+    - name: Pull latest changes before pushing
+      run: |
+        git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes to pull"
+
     - name: Push changes
       if: "github.event_name != 'pull_request'"
       uses: ad-m/github-push-action@master
