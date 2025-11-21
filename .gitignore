@@ -1,0 +1,3 @@
+.secrets
+.env
+gcp-credentials.json

@@ -81,31 +81,96 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
 
+    env:
+      PROJECT_ID: ${{ secrets.GKE_PROJECT }}
+      GKE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
+      GKE_REGION: ${{ secrets.GKE_REGION }}
+      USE_GKE_GCLOUD_AUTH_PLUGIN: True
+
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
 
     - name: Setup Kustomize
       uses: imranismail/setup-kustomize@v1
       with:
         kustomize-version: "3.6.1"
 
+    - name: Authenticate to Google Cloud
+      uses: 'google-github-actions/auth@v0'
+      with:
+        credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0
+      with:
+        install_kubectl: true
+
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        # Install the GKE auth plugin required for kubectl to authenticate with GKE clusters
+        gcloud components install gke-gcloud-auth-plugin --quiet || echo "Plugin may already be installed"
+        # Ensure it's in the PATH
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+        
+    - name: Get the GKE credentials to deploy to the cluster
+      run: |
+        export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+        gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_REGION"
+
     - name: Update Kubernetes resources
       env:
         DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       run: |
        cd k8s
-       kustomize edit set namespace hello-gitops
-       kustomize edit set image hello-gitops=$DOCKER_USERNAME/hello-gitops:$GITHUB_SHA
+       kustomize edit set image hello-gitops=$DOCKER_USERNAME/hello-gitops:${{ github.sha }}
        cat kustomization.yaml
-        
-    - name: Commit files
+    
+    - name: Install ArgoCD
+      run: |
+        # Create namespace if it doesn't exist
+        kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+        # Install ArgoCD (idempotent operation)
+        kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+    # --- Apply ArgoCD Application resource ---
+    - name: Deploy ArgoCD application
+      run: |
+        kubectl apply -f argocd/application.yaml
+
+    # --- Ensure ArgoCD sync policy is set (ArgoCD will auto-sync after Git push) ---
+    - name: Configure ArgoCD sync policy
+      run: |
+        # Wait for ArgoCD server to be ready
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s || true
+        # Ensure automated sync policy is enabled (idempotent)
+        kubectl patch application python-app -n argocd \
+          --type merge -p '{"spec": {"syncPolicy": {"automated": {"selfHeal": true, "prune": true}}}}' || echo "Application may not exist yet, will be created on next step"
+
+    - name: Prepare Git for commit and push
+      if: "github.event_name != 'pull_request'"
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git commit -am "Bump docker tag"
+        # Pull latest changes to avoid conflicts
+        git pull --rebase origin main
+
+    - name: Commit files
+      if: "github.event_name != 'pull_request'"
+      run: |
+        # Only commit if there are changes
+        if [ -n "$(git status --porcelain)" ]; then
+          git add k8s/kustomization.yaml
+          git commit -m "Bump docker tag to ${{ github.sha }}"
+        else
+          echo "No changes to commit"
+        fi
 
     - name: Push changes
+      if: "github.event_name != 'pull_request'"
       uses: ad-m/github-push-action@master
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
