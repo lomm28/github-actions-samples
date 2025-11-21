@@ -5,9 +5,9 @@ name: GitOps CI/CD Workflow
 
 on:
   push:
-    branches: [ feat/argo-cd-deployment-to-gke ]
+    branches: [ main ]
   pull_request:
-    branches: [ feat/argo-cd-deployment-to-gke ]
+    branches: [ main ]
 
 jobs:
   build:
@@ -89,7 +89,10 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
 
     - name: Setup Kustomize
       uses: imranismail/setup-kustomize@v1
@@ -147,10 +150,17 @@ jobs:
         kubectl patch application python-app -n argocd \
           --type merge -p '{"spec": {"syncPolicy": {"automated": {"selfHeal": true, "prune": true}}}}' || echo "Application may not exist yet, will be created on next step"
 
-    - name: Commit files
+    - name: Prepare Git for commit and push
+      if: "github.event_name != 'pull_request'"
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
+        # Pull latest changes to avoid conflicts
+        git pull --rebase origin main
+
+    - name: Commit files
+      if: "github.event_name != 'pull_request'"
+      run: |
         # Only commit if there are changes
         if [ -n "$(git status --porcelain)" ]; then
           git add k8s/kustomization.yaml
@@ -158,10 +168,6 @@ jobs:
         else
           echo "No changes to commit"
         fi
-
-    - name: Pull latest changes before pushing
-      run: |
-        git pull --rebase origin ${{ github.ref_name }} || echo "No remote changes to pull"
 
     - name: Push changes
       if: "github.event_name != 'pull_request'"

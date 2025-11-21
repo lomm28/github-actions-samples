@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/lomm28/github-actions-samples.git
-    targetRevision: feat/argo-cd-deployment-to-gke
+    targetRevision: main
     path: k8s
   destination:
     server: https://kubernetes.default.svc
