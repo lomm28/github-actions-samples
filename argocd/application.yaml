@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: python-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/lomm28/github-actions-samples.git
+    targetRevision: feat/argo-cd-deployment-to-gke
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: hello-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
